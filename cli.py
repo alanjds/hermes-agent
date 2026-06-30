@@ -175,7 +175,7 @@ from hermes_cli.browser_connect import (
     try_launch_chrome_debug,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
-from utils import base_url_host_matches
+from utils import base_url_host_matches, fast_safe_load
 
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
@@ -510,7 +510,7 @@ def load_cli_config() -> Dict[str, Any]:
             with open(config_path, "r", encoding="utf-8") as f:
                 from hermes_cli.config import _normalize_root_model_keys
 
-                file_config = _normalize_root_model_keys(yaml.safe_load(f) or {})
+                file_config = _normalize_root_model_keys(fast_safe_load(f) or {})
             
             _file_has_terminal_config = "terminal" in file_config
 
@@ -748,6 +748,14 @@ try:
     from agent.display import set_tool_preview_max_len
     _tpl = CLI_CONFIG.get("display", {}).get("tool_preview_length", 0)
     set_tool_preview_max_len(int(_tpl) if _tpl else 0)
+except Exception:
+    pass
+
+# Initialize friendly tool labels from config (default on)
+try:
+    from agent.display import set_friendly_tool_labels
+    _ftl = CLI_CONFIG.get("display", {}).get("friendly_tool_labels", True)
+    set_friendly_tool_labels(bool(_ftl))
 except Exception:
     pass
 
@@ -4004,6 +4012,32 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         except Exception:
             pass
 
+    def _recover_terminal_after_interrupt(self) -> None:
+        """Recover the terminal after an interrupted agent turn (#33271).
+
+        When the user interrupts a running turn by typing a new message,
+        prompt_toolkit may have an in-flight ``CSI 6n`` cursor-position query
+        whose reply (``ESC[<row>;<col>R``) arrives on stdin after the input
+        parser has torn down. The reply then leaks as literal text
+        (``^[[19;1R``) and the VT100 parser can stall in a partial-escape
+        state, accepting no further keystrokes — the terminal appears frozen.
+
+        Two steps recover a sane state:
+          1. ``flush_stdin()`` drains stray escape bytes from the OS input
+             buffer (``termios.tcflush(TCIFLUSH)``; no-op on non-TTY).
+          2. ``_force_full_redraw()`` drops prompt_toolkit's cached
+             screen/cursor state and forces a clean repaint.
+
+        Both steps are independently safe and self-guard, so a failure of one
+        never prevents the other.
+        """
+        try:
+            from hermes_cli.curses_ui import flush_stdin
+            flush_stdin()
+        except Exception:
+            pass
+        self._force_full_redraw()
+
     def _clear_prompt_toolkit_screen(self, app, *, rebuild_scrollback: bool = False) -> None:
         """Clear the terminal and reset prompt_toolkit renderer state."""
         try:
@@ -5880,6 +5914,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 enabled_toolsets=self.enabled_toolsets,
                 session_id=self.session_id,
                 context_length=ctx_len,
+                provider=self.provider,
             )
         
         # Tool discovery is intentionally deferred on the Termux bare prompt
@@ -8148,6 +8183,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         enabled_toolsets=self.enabled_toolsets,
                         session_id=self.session_id,
                         context_length=ctx_len,
+                        provider=self.provider,
                     )
                 _cprint("  ✨ (◕‿◕)✨ Fresh start! Screen cleared and conversation reset.\n")
                 # Show a random tip on new session
@@ -10472,6 +10508,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         stacked line to scrollback on tool.completed so users can see the
         full history of tool calls (not just the current one in the spinner).
         """
+        # MoA reference-model outputs: render each reference's answer as a
+        # labelled thinking-style block BEFORE the aggregator acts, so the user
+        # sees the mixture-of-agents process instead of a silent pause. These
+        # are display-only events emitted by the MoA facade (agent_init relay);
+        # they never enter message history.
+        if event_type == "moa.reference":
+            label = function_name or "reference"
+            text = preview or ""
+            idx = kwargs.get("moa_index")
+            count = kwargs.get("moa_count")
+            header = f"Reference {idx}/{count} — {label}" if idx and count else f"Reference — {label}"
+            try:
+                self._flush_reasoning_preview(force=True)
+            except Exception:
+                pass
+            _cprint(f"  {_DIM}┊ ◇ {header}{_RST}")
+            try:
+                self._emit_reasoning_preview(text)
+            except Exception:
+                # Fallback: print the raw text dimmed if the preview helper fails.
+                if text.strip():
+                    _cprint(f"  {_DIM}{text.strip()}{_RST}")
+            self._invalidate()
+            return
+        if event_type == "moa.aggregating":
+            agg = function_name or ""
+            self._spinner_text = f"◆ aggregating ({agg})" if agg else "◆ aggregating"
+            self._invalidate()
+            return
+
         # Feed the pet: tools mean "running" (not reasoning); a failed tool
         # latches the turn so it ends on a sulk.
         if event_type == "tool.started":
@@ -10483,8 +10549,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
         if event_type == "tool.completed":
             self._tool_start_time = 0.0
-            # Print stacked scrollback line for "all" / "new" modes
-            if function_name and self.tool_progress_mode in {"all", "new"}:
+            # Print stacked scrollback line for "new" / "all" / "verbose" modes.
+            # "verbose" was previously omitted here, so non-streaming model
+            # calls (MoA aggregator, copilot-acp) rendered each tool only into
+            # the transient spinner line — which overwrites itself, so no
+            # scrollable tool history accumulated. Streaming models hid the bug
+            # because _on_tool_gen_start commits a "preparing" line per tool;
+            # non-streaming calls never emit that, leaving verbose mode with no
+            # committed line at all. "verbose" is strictly more than "all", so
+            # it must commit at least the same line.
+            if function_name and self.tool_progress_mode in {"new", "all", "verbose"}:
                 duration = kwargs.get("duration", 0.0)
                 is_error = kwargs.get("is_error", False)
                 # Pop stored args from tool.started for this function
@@ -11476,6 +11550,51 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         except Exception:
             pass
 
+    def _clear_active_overlays_for_interrupt(self) -> None:
+        """Drain and clear every input-blocking overlay left by an interrupted agent.
+
+        approval/clarify/sudo/secret prompts each block a worker thread on a
+        ``response_queue.get()``.  When the agent is interrupted the worker
+        thread is torn down, but the overlay's state dict stays set — leaving
+        the CLI input gated (``read_only`` condition + keypress filter) with no
+        thread servicing the prompt.  The result is a frozen terminal until the
+        prompt's own timeout expires.  Push a terminal value onto each queue so
+        any still-blocked thread unblocks cleanly, then nil the state out and
+        restore the user's pre-modal draft (#14026).
+
+        Safe default per prompt: approval -> "deny", clarify/sudo/secret ->
+        cancel (None / empty).  Each step is wrapped so a dead queue can't
+        prevent clearing the others.
+        """
+        if self._approval_state:
+            try:
+                self._approval_state["response_queue"].put("deny")
+            except Exception:
+                pass
+            self._approval_state = None
+        if self._clarify_state:
+            try:
+                self._clarify_state["response_queue"].put(
+                    "The user cancelled. Use your best judgement to proceed."
+                )
+            except Exception:
+                pass
+            self._clarify_state = None
+            self._clarify_freetext = False
+        if self._sudo_state:
+            try:
+                self._sudo_state["response_queue"].put("")
+            except Exception:
+                pass
+            self._sudo_state = None
+            self._sudo_deadline = 0
+            self._restore_modal_input_snapshot()
+        if self._secret_state:
+            try:
+                self._cancel_secret_capture()
+            except Exception:
+                self._secret_state = None
+
     def _submit_secret_response(self, value: str) -> None:
         if not self._secret_state:
             return
@@ -11852,6 +11971,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                             if stop_event is not None:
                                 stop_event.set()
                             self.agent.interrupt(interrupt_msg)
+                            # Clear any active overlay states the interrupted agent
+                            # left behind.  approval/clarify/sudo/secret prompts gate
+                            # input (read_only condition + keypress filter) until
+                            # explicitly reset — without this the CLI freezes after
+                            # an interrupt until the prompt's own timeout expires (#14026).
+                            self._clear_active_overlays_for_interrupt()
                             # Debug: log to file (stdout may be devnull from redirect_stdout)
                             try:
                                 _dbg = _hermes_home / "interrupt_debug.log"
@@ -13179,50 +13304,42 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 event.app.invalidate()
                 return
 
-            # Cancel sudo prompt
-            if self._sudo_state:
-                self._sudo_state["response_queue"].put("")
-                self._sudo_state = None
-                event.app.invalidate()
-                return
-
-            # Cancel secret prompt
-            if self._secret_state:
-                self._cancel_secret_capture()
-                event.app.current_buffer.reset()
-                event.app.invalidate()
-                return
-
-            # Cancel approval prompt (deny)
-            if self._approval_state:
-                self._approval_state["response_queue"].put("deny")
-                self._approval_state = None
-                event.app.invalidate()
-                return
-
-            # Cancel slash confirmation prompt
+            # Cancel slash confirmation prompt (foreground UI, not an
+            # agent-blocking overlay — cancel and stop here).
             if self._slash_confirm_state:
                 self._submit_slash_confirm_response("cancel")
                 event.app.current_buffer.reset()
                 event.app.invalidate()
                 return
 
-            # Cancel /model picker
+            # Cancel /model picker (foreground UI — cancel and stop here).
             if self._model_picker_state:
                 self._close_model_picker()
                 event.app.current_buffer.reset()
                 event.app.invalidate()
                 return
 
-            # Cancel clarify prompt
-            if self._clarify_state:
-                self._clarify_state["response_queue"].put(
-                    "The user cancelled. Use your best judgement to proceed."
-                )
-                self._clarify_state = None
-                self._clarify_freetext = False
+            # Clear all agent-blocking overlays (approval/clarify/sudo/secret)
+            # in one shot.  We do NOT return after clearing — we fall through so
+            # that if the agent is also running we fire the interrupt on the same
+            # Ctrl+C press.  This fixes the case where a stale/orphaned overlay
+            # (left behind by a previous interrupt) consumes the press without
+            # ever reaching the agent-interrupt branch, leaving the chat frozen
+            # (#14026).
+            _overlay_cleared = bool(
+                self._sudo_state
+                or self._secret_state
+                or self._approval_state
+                or self._clarify_state
+            )
+            if _overlay_cleared:
+                self._clear_active_overlays_for_interrupt()
                 event.app.current_buffer.reset()
                 event.app.invalidate()
+
+            # If we only cleared overlays and the agent is NOT running, stop here
+            # (don't fall through to the interrupt/exit path).
+            if _overlay_cleared and not (self._agent_running and self.agent):
                 return
 
             if self._agent_running and self.agent:
@@ -13279,50 +13396,35 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 event.app.invalidate()
                 return
 
-            # Cancel sudo prompt
-            if self._sudo_state:
-                self._sudo_state["response_queue"].put("")
-                self._sudo_state = None
-                event.app.invalidate()
-                return
-
-            # Cancel secret prompt
-            if self._secret_state:
-                self._cancel_secret_capture()
-                event.app.current_buffer.reset()
-                event.app.invalidate()
-                return
-
-            # Cancel approval prompt (deny)
-            if self._approval_state:
-                self._approval_state["response_queue"].put("deny")
-                self._approval_state = None
-                event.app.invalidate()
-                return
-
-            # Cancel slash confirmation prompt
+            # Cancel slash confirmation prompt (foreground UI — cancel and stop).
             if self._slash_confirm_state:
                 self._submit_slash_confirm_response("cancel")
                 event.app.current_buffer.reset()
                 event.app.invalidate()
                 return
 
-            # Cancel /model picker
+            # Cancel /model picker (foreground UI — cancel and stop).
             if self._model_picker_state:
                 self._close_model_picker()
                 event.app.current_buffer.reset()
                 event.app.invalidate()
                 return
 
-            # Cancel clarify prompt
-            if self._clarify_state:
-                self._clarify_state["response_queue"].put(
-                    "The user cancelled. Use your best judgement to proceed."
-                )
-                self._clarify_state = None
-                self._clarify_freetext = False
+            # Clear all agent-blocking overlays in one shot, then fall through to
+            # the agent-interrupt branch so a single Ctrl+Q both clears a stale
+            # overlay and interrupts a still-running agent (#14026).
+            _overlay_cleared = bool(
+                self._sudo_state
+                or self._secret_state
+                or self._approval_state
+                or self._clarify_state
+            )
+            if _overlay_cleared:
+                self._clear_active_overlays_for_interrupt()
                 event.app.current_buffer.reset()
                 event.app.invalidate()
+
+            if _overlay_cleared and not (self._agent_running and self.agent):
                 return
 
             if self._agent_running and self.agent:
@@ -14662,6 +14764,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
 
                         app.invalidate()  # Refresh status line
 
+                        # Post-turn terminal recovery (#33271): after an
+                        # interrupt the prompt_toolkit renderer may have
+                        # drifted from the physical terminal state — CSI 6n
+                        # cursor position reports can leak as literal text
+                        # (^[[19;1R), and the VT100 input parser can stall in
+                        # a partial-escape state, accepting no further
+                        # keystrokes.  Drain stray escape bytes from the OS
+                        # input buffer and force a clean renderer redraw.
+                        if self._last_turn_interrupted:
+                            self._recover_terminal_after_interrupt()
+
                         # Goal continuation: if a standing goal is active, ask
                         # the judge whether the turn satisfied it. If not, and
                         # there's no real user message already queued, push the
@@ -15274,7 +15387,21 @@ def main(
         )
         if missing_skills:
             missing_display = ", ".join(missing_skills)
-            raise ValueError(f"Unknown skill(s): {missing_display}")
+            # If at least one skill loaded, degrade gracefully: skip the
+            # unknown ones and continue. A typo'd skill name should not crash
+            # the worker (which auto-blocks the Kanban task after retries).
+            # Only when EVERY requested skill is missing do we hard-fail, so a
+            # fully-misconfigured worker fails loudly instead of running blind.
+            if loaded_skills:
+                logger.warning(
+                    "Unknown skill(s) requested, skipping: %s. "
+                    "Continuing with: %s. "
+                    "List available skills with `hermes skills list`.",
+                    missing_display,
+                    ", ".join(loaded_skills),
+                )
+            else:
+                raise ValueError(f"Unknown skill(s): {missing_display}")
         if skills_prompt:
             cli.system_prompt = "\n\n".join(
                 part for part in (cli.system_prompt, skills_prompt) if part
