@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import type { DesktopAuthProvider, DesktopConnectionProbeResult } from '@/global'
 import { useI18n } from '@/i18n'
+import { isBrowserFallbackActive } from '@/lib/browser-bridge'
 import { AlertCircle, Check, FileText, Globe, Loader2, LogIn, Monitor } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
@@ -417,7 +418,15 @@ export function GatewaySettings() {
   }
 
   if (!window.hermesDesktop?.getConnectionConfig) {
-    return <EmptyState description={g.unavailableDesc} title={g.unavailableTitle} />
+    // Browser-fallback mode has no config storage to edit — the gateway URL
+    // is fixed via ?gateway=/VITE_GATEWAY_URL for the whole page load — so
+    // point at that instead of the generic "IPC bridge" message.
+    return (
+      <EmptyState
+        description={isBrowserFallbackActive() ? g.unavailableBrowserDesc : g.unavailableDesc}
+        title={g.unavailableTitle}
+      />
+    )
   }
 
   return (

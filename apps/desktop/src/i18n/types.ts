@@ -421,6 +421,7 @@ export interface Translations {
       loading: string
       unavailableTitle: string
       unavailableDesc: string
+      unavailableBrowserDesc: string
       title: string
       envOverride: string
       intro: string

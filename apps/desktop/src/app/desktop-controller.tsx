@@ -10,6 +10,7 @@ import { GatewayConnectingOverlay } from '@/components/gateway-connecting-overla
 import { Pane, PaneMain } from '@/components/pane-shell'
 import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { useMediaQuery } from '@/hooks/use-media-query'
+import { isBrowserFallbackActive } from '@/lib/browser-bridge'
 import { cn } from '@/lib/utils'
 import { useSkinCommand } from '@/themes/use-skin-command'
 
@@ -1254,7 +1255,8 @@ export function DesktopController() {
   const fileBrowserPane = (
     <Pane
       defaultOpen={false}
-      disabled={!chatOpen}
+      // No native FS access outside Electron — hide rather than break on open.
+      disabled={!chatOpen || isBrowserFallbackActive()}
       forceCollapsed={narrowViewport}
       hoverReveal
       id="file-browser"
@@ -1285,7 +1287,8 @@ export function DesktopController() {
       // gate so the pane stays mounted as a collapsed overlay — `toggleReview`
       // then slides it in/out via the forced-reveal pin, exactly like ⌘B for the
       // sidebar. Still requires a repo (no diffs to show otherwise).
-      disabled={!chatOpen || !currentCwd.trim() || (!narrowViewport && !reviewOpen)}
+      // No native git access outside Electron — hide rather than break on open.
+      disabled={!chatOpen || !currentCwd.trim() || (!narrowViewport && !reviewOpen) || isBrowserFallbackActive()}
       forceCollapsed={narrowViewport}
       hoverReveal
       id={REVIEW_PANE_ID}
@@ -1306,7 +1309,8 @@ export function DesktopController() {
     <Pane
       bottomRow={terminalAsRow}
       defaultOpen
-      disabled={!terminalSidebarOpen}
+      // No native PTY access outside Electron — hide rather than break on open.
+      disabled={!terminalSidebarOpen || isBrowserFallbackActive()}
       divider
       height="38vh"
       id="terminal-sidebar"

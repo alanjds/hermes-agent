@@ -500,6 +500,8 @@ export const en: Translations = {
       loading: 'Loading gateway settings...',
       unavailableTitle: 'Gateway settings unavailable',
       unavailableDesc: 'The desktop IPC bridge does not expose gateway settings.',
+      unavailableBrowserDesc:
+        'Running in a browser tab has no settings storage. Set the gateway with ?gateway=http://host:port in the page URL (and &token=... if it needs one), or bake VITE_GATEWAY_URL into the build.',
       title: 'Gateway Connection',
       envOverride: 'env override',
       intro:

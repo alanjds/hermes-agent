@@ -1,3 +1,7 @@
+// Side-effect: installs a browser-fallback window.hermesDesktop when running
+// outside Electron with a configured gateway URL. Must run before anything
+// else that might read window.hermesDesktop.
+import './lib/browser-bridge'
 import './styles.css'
 // Side-effect: applies the persisted window translucency on load.
 import './store/translucency'
