@@ -1068,7 +1068,7 @@ Rules:
 
 - **Exact origins only** — `scheme://host[:port]`, e.g. `"http://192.168.1.50:4174"`. Never a wildcard or pattern; a leaked or typo'd entry can grant at most one extra origin.
 - **Fail-closed on a malformed entry** — an entry that isn't a clean origin (wrong scheme, includes a path/query, contains a wildcard, etc.) refuses to start the dashboard with a clear error, rather than silently running with a smaller allowlist than you configured.
-- **Ignored while bound to loopback** — loopback is never reachable from another origin's browser regardless of CORS, so a configured `allowed_origins` value while `--host` is unset (or explicitly loopback) is a no-op: the dashboard boots normally, logs a warning that it's being ignored, and CORS stays loopback-only. It only takes effect once you bind non-loopback (`--host <lan-ip>`), which — as with every non-loopback bind — also requires an auth provider to be configured.
+- **Refuses to start while bound to loopback** — loopback is never reachable from another origin's browser regardless of CORS, so a configured `allowed_origins` value while `--host` is unset (or explicitly loopback) fails closed with a clear startup error rather than silently running with the setting inert. It only takes effect once you bind non-loopback (`--host <lan-ip>`), which — as with every non-loopback bind — also requires an auth provider to be configured.
 - **Widens the WebSocket Origin guard too** — an extra-allowed origin can also open the `/api/ws` gateway WebSocket, not just make REST calls; the Host-header DNS-rebinding check is unaffected either way.
 
 ### Scope: this is not the same as cross-*site* gated access

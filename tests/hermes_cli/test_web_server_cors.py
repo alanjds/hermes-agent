@@ -184,27 +184,23 @@ def restore_app_state():
 
 
 class TestStartServerAllowedOrigins:
-    def test_loopback_with_configured_origins_warns_and_ignores(
-        self, monkeypatch, patch_config, restore_app_state, caplog
+    def test_loopback_with_configured_origins_fails_closed(
+        self, monkeypatch, patch_config, restore_app_state
     ):
         """Setting allowed_origins while still bound to loopback can't do
         anything useful (loopback is unreachable from another origin's
-        browser regardless of CORS) — warn and ignore rather than refuse
-        to start, per the conservative-diff decision."""
+        browser regardless of CORS) and almost always means a config
+        copied from a gated deploy onto a loopback dev box — refuse to
+        start with a clear error rather than silently running inert."""
         _stub_uvicorn_run(monkeypatch)
         monkeypatch.delenv("HERMES_DASHBOARD_ALLOWED_ORIGINS", raising=False)
         patch_config(["http://192.168.1.50:4174"])
 
-        with caplog.at_level(logging.WARNING, logger=web_server._log.name):
+        with pytest.raises(SystemExit, match="allowed_origins") as exc_info:
             web_server.start_server(
                 host="127.0.0.1", port=9119, open_browser=False, allow_public=False,
             )
-
-        assert web_server.app.state.allowed_origins == ()
-        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert any(
-            "allowed_origins" in m and "loopback" in m for m in warnings
-        ), f"expected a loopback-ignored warning, got: {warnings!r}"
+        assert "loopback" in str(exc_info.value)
 
     def test_gated_mode_with_configured_origins_succeeds(
         self, monkeypatch, patch_config, restore_app_state, caplog

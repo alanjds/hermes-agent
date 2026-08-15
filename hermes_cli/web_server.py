@@ -13361,26 +13361,27 @@ def start_server(
         ) from exc
 
     if _allowed_origins and host in _LOOPBACK_HOST_VALUES:
-        # Loopback is unreachable remotely regardless of CORS — widening
-        # the allowlist here can't do anything useful, so ignore it rather
-        # than refuse to start. Warn (not silent) so the operator notices
-        # their setting isn't taking effect.
-        _log.warning(
-            "dashboard.allowed_origins is set (%s) but the dashboard is bound to "
-            "loopback (%s), which is never reachable from another origin's browser "
-            "regardless of CORS. Ignoring — CORS stays loopback-only. Bind "
-            "non-loopback (--host <lan-ip>) with an auth provider configured to use "
-            "this setting.",
-            ", ".join(_allowed_origins), host,
+        # Loopback is unreachable remotely regardless of CORS — configuring
+        # allowed_origins while still bound to loopback can only mean a
+        # misconfiguration (e.g. a config.yaml copied from a gated prod box
+        # onto a loopback dev box), so refuse to start rather than silently
+        # running with the setting inert. Matches the fail-closed style used
+        # below for the missing-auth-provider case.
+        raise SystemExit(
+            f"Refusing to start — dashboard.allowed_origins is set ({', '.join(_allowed_origins)}) "
+            f"but the dashboard is bound to loopback ({host}), which is never reachable "
+            f"from another origin's browser regardless of CORS. Either bind non-loopback "
+            f"(--host <lan-ip>, which also requires an auth provider — see below) to use "
+            f"this setting, or remove dashboard.allowed_origins / "
+            f"HERMES_DASHBOARD_ALLOWED_ORIGINS to stay on loopback."
         )
-        app.state.allowed_origins = ()
-    else:
-        app.state.allowed_origins = _allowed_origins
-        if _allowed_origins:
-            _log.warning(
-                "Dashboard CORS + WebSocket Origin guard also trusting: %s",
-                ", ".join(_allowed_origins),
-            )
+
+    app.state.allowed_origins = _allowed_origins
+    if _allowed_origins:
+        _log.warning(
+            "Dashboard CORS + WebSocket Origin guard also trusting: %s",
+            ", ".join(_allowed_origins),
+        )
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
     # the hermes-0day MCP-persistence campaign abused unauthenticated public

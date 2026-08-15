@@ -1896,9 +1896,11 @@ DEFAULT_CONFIG = {
         # allowlist rather than a UX convenience.
         #
         # Only takes effect when the dashboard is bound non-loopback
-        # (``--host``); while bound to loopback, any configured origins are
-        # ignored with a logged warning, since loopback is unreachable
-        # remotely regardless of CORS.
+        # (``--host``); a configured value while still bound to loopback
+        # refuses to start (``SystemExit``) rather than silently running
+        # inert, since loopback is unreachable remotely regardless of CORS
+        # and the combination almost always means a config copied from a
+        # gated deploy onto a loopback dev box.
         #
         # Scope note: gated/OAuth-mode auth uses a ``SameSite=Lax`` cookie,
         # which independently blocks it on a genuinely cross-*site* request
