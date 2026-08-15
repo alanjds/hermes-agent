@@ -187,6 +187,36 @@ def insecure_explicit_host_app():
     web_server.app.state.auth_required = prev_required
 
 
+@pytest.fixture
+def gated_app_with_extra_origin():
+    """``gated_app`` plus a configured ``dashboard.allowed_origins`` entry.
+
+    Models the ``apps/desktop`` browser-fallback deployment shape: the
+    dashboard is bound non-loopback with the OAuth gate on, and the
+    operator has opted a browser-hosted client on a *different* origin
+    into the WS Origin guard via ``dashboard.allowed_origins``.
+    """
+    _reset_for_tests()
+    clear_providers()
+    register_provider(StubAuthProvider())
+    prev_host = getattr(web_server.app.state, "bound_host", None)
+    prev_port = getattr(web_server.app.state, "bound_port", None)
+    prev_required = getattr(web_server.app.state, "auth_required", None)
+    prev_origins = getattr(web_server.app.state, "allowed_origins", None)
+    web_server.app.state.bound_host = "fly-app.fly.dev"
+    web_server.app.state.bound_port = 443
+    web_server.app.state.auth_required = True
+    web_server.app.state.allowed_origins = ("https://desktop-webapp.example",)
+    client = TestClient(web_server.app, base_url="https://fly-app.fly.dev")
+    yield client
+    clear_providers()
+    _reset_for_tests()
+    web_server.app.state.bound_host = prev_host
+    web_server.app.state.bound_port = prev_port
+    web_server.app.state.auth_required = prev_required
+    web_server.app.state.allowed_origins = prev_origins
+
+
 def _fake_ws(*, query: dict, client_host: str = "127.0.0.1", path: str = "/api/pty"):
     """Build a stand-in for starlette.WebSocket good enough for _ws_auth_ok."""
 
@@ -548,6 +578,54 @@ class TestWsHostOriginGuardOrigins:
     def test_gated_same_host_https_origin_allowed(self, gated_app):
         ws = self._ws(origin="https://fly-app.fly.dev", host="fly-app.fly.dev")
         assert web_server._ws_host_origin_is_allowed(ws) is True
+
+    # -----------------------------------------------------------------
+    # dashboard.allowed_origins: extra-origin allowlist widens the Origin
+    # check (not the Host check) for the apps/desktop browser-fallback
+    # deployment shape — a browser-hosted client on a different origin
+    # than the dashboard opening the gateway WebSocket, not just making
+    # REST calls.
+    # -----------------------------------------------------------------
+
+    def test_configured_extra_origin_accepted_despite_mismatch(
+        self, gated_app_with_extra_origin
+    ):
+        ws = self._ws(
+            origin="https://desktop-webapp.example", host="fly-app.fly.dev",
+        )
+        assert web_server._ws_host_origin_is_allowed(ws) is True
+
+    def test_configured_extra_origin_default_port_normalisation_symmetry(
+        self, gated_app_with_extra_origin
+    ):
+        """``dashboard.allowed_origins`` entries are normalised (default
+        port stripped) at resolution time; the incoming Origin header must
+        be normalised the same way for the comparison to line up."""
+        ws = self._ws(
+            origin="https://desktop-webapp.example:443", host="fly-app.fly.dev",
+        )
+        assert web_server._ws_host_origin_is_allowed(ws) is True
+
+    def test_non_configured_cross_site_origin_still_rejected(
+        self, gated_app_with_extra_origin
+    ):
+        """Configuring one extra origin doesn't open the door to others —
+        an unrelated cross-site origin is still rejected."""
+        ws = self._ws(origin="https://evil.test", host="fly-app.fly.dev")
+        assert web_server._ws_host_origin_is_allowed(ws) is False
+
+    def test_host_mismatch_still_rejected_even_with_matching_extra_origin(
+        self, gated_app_with_extra_origin
+    ):
+        """The most important regression case: a Host-header mismatch
+        (the DNS-rebinding shape) is rejected even when the Origin happens
+        to match a configured extra origin — the allowlist widens the
+        Origin check only, never the Host check, so it can't be used to
+        bypass DNS-rebinding defense."""
+        ws = self._ws(
+            origin="https://desktop-webapp.example", host="evil.test",
+        )
+        assert web_server._ws_host_origin_is_allowed(ws) is False
 
 
 class TestSidecarUrl:

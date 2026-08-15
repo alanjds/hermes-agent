@@ -1880,6 +1880,33 @@ DEFAULT_CONFIG = {
         # falls through to request reconstruction rather than breaking
         # the login flow.
         "public_url": "",
+        # Extra CORS + WebSocket origins to trust, beyond the built-in
+        # loopback allowance (env: ``HERMES_DASHBOARD_ALLOWED_ORIGINS``,
+        # comma-separated; wins over this list when non-empty). Needed only
+        # when a browser-hosted client on a *different* origin than the
+        # dashboard talks to it — e.g. ``apps/desktop``'s browser-fallback
+        # mode served statically on its own port, making cross-origin
+        # fetch/WebSocket calls back to the dashboard. Opening the
+        # dashboard's own URL directly needs none of this.
+        #
+        # Each entry must be an exact origin (``scheme://host[:port]``,
+        # e.g. ``"http://192.168.1.50:4174"``) — never a wildcard or
+        # pattern. A malformed entry is a fail-closed startup error
+        # (``SystemExit``), not a silent drop, since this is a security
+        # allowlist rather than a UX convenience.
+        #
+        # Only takes effect when the dashboard is bound non-loopback
+        # (``--host``); while bound to loopback, any configured origins are
+        # ignored with a logged warning, since loopback is unreachable
+        # remotely regardless of CORS.
+        #
+        # Scope note: gated/OAuth-mode auth uses a ``SameSite=Lax`` cookie,
+        # which independently blocks it on a genuinely cross-*site* request
+        # no matter what is allowed here — so this realistically only
+        # widens access to a same-site origin (same host/IP, different
+        # port). True cross-site gated access is out of scope; the legacy
+        # static-token mode isn't cookie-based and isn't bound by this.
+        "allowed_origins": [],
     },
 
     # Privacy settings

@@ -275,16 +275,54 @@ _reveal_timestamps: List[float] = []
 _REVEAL_MAX_PER_WINDOW = 5
 _REVEAL_WINDOW_SECONDS = 30
 
-# CORS: restrict to localhost origins only.  The web UI is intended to run
-# locally; binding to 0.0.0.0 with allow_origins=["*"] would let any website
-# read/modify config and secrets.
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
-    allow_methods=["*"],
-    allow_headers=["*"],
+from hermes_cli.dashboard_auth.cors import (  # noqa: E402
+    InvalidOriginError, resolve_allowed_origins, validate_origin,
 )
+
+# CORS: restrict to localhost origins by default, plus any operator-typed
+# exact origins from ``dashboard.allowed_origins`` / the
+# ``HERMES_DASHBOARD_ALLOWED_ORIGINS`` env var (see
+# ``hermes_cli/dashboard_auth/cors.py``).  The web UI is intended to run
+# locally; binding to 0.0.0.0 with allow_origins=["*"] would let any website
+# read/modify config and secrets — the extra allowlist is opt-in and
+# exact-origin-only, never a wildcard, to preserve that.
+
+
+def _dashboard_cors_kwargs(extra_origins: Tuple[str, ...] = ()) -> dict:
+    """Build the ``CORSMiddleware`` kwargs for the dashboard app.
+
+    Factored out so tests can build an isolated throwaway ``FastAPI()`` app
+    with these kwargs — Starlette locks ``add_middleware()`` after the first
+    request, so the real ``app`` singleton below can't be reconfigured
+    per-test.
+
+    ``allow_credentials=True`` is required for a browser to read a
+    credentialed cross-origin response at all (the session cookie / the
+    ``X-Hermes-Session-Token`` header round-trip both need it); combined
+    with an explicit ``allow_origins`` list (never ``"*"``), Starlette
+    always echoes back the specific matched request origin in
+    ``Access-Control-Allow-Origin``, never a wildcard, for both the
+    loopback regex match and an explicit-list match.
+    """
+    return {
+        "allow_origin_regex": r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
+        "allow_origins": list(extra_origins),
+        "allow_credentials": True,
+        "allow_methods": ["*"],
+        "allow_headers": ["*"],
+    }
+
+
+try:
+    _cors_extra_origins = resolve_allowed_origins()
+except InvalidOriginError as _cors_exc:
+    raise SystemExit(
+        f"Invalid dashboard.allowed_origins / HERMES_DASHBOARD_ALLOWED_ORIGINS entry: {_cors_exc}\n\n"
+        "Each entry must be an exact origin (scheme://host[:port]), e.g. "
+        '"http://192.168.1.50:4174" — no wildcards, paths, or query strings.'
+    ) from _cors_exc
+
+app.add_middleware(CORSMiddleware, **_dashboard_cors_kwargs(_cors_extra_origins))
 
 # ---------------------------------------------------------------------------
 # Endpoints that do NOT require the session token.  Everything else under
@@ -11418,6 +11456,22 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
         return f"origin_mismatch origin={origin} bound={bound_host}"
 
     if not _is_accepted_host(parsed.netloc, bound_host):
+        # Fall back to the operator-configured extra-origin allowlist
+        # (dashboard.allowed_origins / HERMES_DASHBOARD_ALLOWED_ORIGINS)
+        # before rejecting — lets a browser client on an extra-allowed
+        # origin also open the gateway WebSocket, not just make REST
+        # calls. The Host-header check above is untouched by this: a
+        # request whose Host doesn't match the bound interface is rejected
+        # unconditionally, so this allowance can't be used to bypass the
+        # DNS-rebinding defense, only to widen the Origin check.
+        allowed_origins = getattr(app.state, "allowed_origins", ())
+        if allowed_origins:
+            try:
+                normalised_origin = validate_origin(origin)
+            except InvalidOriginError:
+                normalised_origin = None
+            if normalised_origin in allowed_origins:
+                return None
         return f"origin_mismatch origin={origin} bound={bound_host}"
     return None
 
@@ -13291,6 +13345,42 @@ def start_server(
     # uses this to decide whether to refuse the bind, log the gate-on
     # banner, and enable uvicorn proxy_headers.
     app.state.auth_required = should_require_auth(host)
+
+    # Re-resolve the extra-origin allowlist (same pure function, same
+    # inputs, as the CORSMiddleware construction above — determinism there
+    # is a documented invariant of resolve_allowed_origins()). A malformed
+    # entry fails closed here too, in case config.yaml changed since import
+    # time (e.g. a `hermes dashboard` re-exec after editing config).
+    try:
+        _allowed_origins = resolve_allowed_origins()
+    except InvalidOriginError as exc:
+        raise SystemExit(
+            f"Invalid dashboard.allowed_origins / HERMES_DASHBOARD_ALLOWED_ORIGINS entry: {exc}\n\n"
+            "Each entry must be an exact origin (scheme://host[:port]), e.g. "
+            '"http://192.168.1.50:4174" — no wildcards, paths, or query strings.'
+        ) from exc
+
+    if _allowed_origins and host in _LOOPBACK_HOST_VALUES:
+        # Loopback is unreachable remotely regardless of CORS — widening
+        # the allowlist here can't do anything useful, so ignore it rather
+        # than refuse to start. Warn (not silent) so the operator notices
+        # their setting isn't taking effect.
+        _log.warning(
+            "dashboard.allowed_origins is set (%s) but the dashboard is bound to "
+            "loopback (%s), which is never reachable from another origin's browser "
+            "regardless of CORS. Ignoring — CORS stays loopback-only. Bind "
+            "non-loopback (--host <lan-ip>) with an auth provider configured to use "
+            "this setting.",
+            ", ".join(_allowed_origins), host,
+        )
+        app.state.allowed_origins = ()
+    else:
+        app.state.allowed_origins = _allowed_origins
+        if _allowed_origins:
+            _log.warning(
+                "Dashboard CORS + WebSocket Origin guard also trusting: %s",
+                ", ".join(_allowed_origins),
+            )
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
     # the hermes-0day MCP-persistence campaign abused unauthenticated public

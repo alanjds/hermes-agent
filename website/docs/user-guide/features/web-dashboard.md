@@ -1050,13 +1050,48 @@ Instead of the in-app setting, you can point the desktop at a backend with an en
 
 ## CORS
 
-The web server restricts CORS to localhost origins only:
+By default the dashboard restricts CORS to loopback origins — any `http://localhost:<port>` or `http://127.0.0.1:<port>` — so a browser tab pointed at the dashboard's own origin (production build, or a Vite dev server on a different loopback port) always works, and no other website can read or modify your config/secrets via a cross-origin request.
 
-- `http://localhost:9119` / `http://127.0.0.1:9119` (production)
-- `http://localhost:3000` / `http://127.0.0.1:3000`
-- `http://localhost:5173` / `http://127.0.0.1:5173` (Vite dev server)
+That default needs no configuration and covers the common case. It does **not** cover a browser-hosted client running on a *different origin* than the dashboard that makes cross-origin `fetch`/WebSocket calls back to it — for example Hermes Desktop's browser-fallback mode (`apps/desktop`, run outside Electron, `?gateway=<url>` query param) served statically on its own port, talking to a `hermes dashboard` backend bound to a LAN/Tailscale IP. If you're just opening the dashboard's own URL directly (e.g. from a phone at `http://<lan-ip>:9119`), you don't need any of the settings below — that already works with `--host <lan-ip>` plus an auth provider, as described above.
 
-If you run the server on a custom port, that origin is added automatically.
+### Trusting an extra origin
+
+Set `dashboard.allowed_origins` (or the `HERMES_DASHBOARD_ALLOWED_ORIGINS` env var, comma-separated — wins over the config value when non-empty) to a list of exact origins to trust, in addition to loopback:
+
+```yaml title="config.yaml"
+dashboard:
+  allowed_origins:
+    - "http://192.168.1.50:4174"
+```
+
+Rules:
+
+- **Exact origins only** — `scheme://host[:port]`, e.g. `"http://192.168.1.50:4174"`. Never a wildcard or pattern; a leaked or typo'd entry can grant at most one extra origin.
+- **Fail-closed on a malformed entry** — an entry that isn't a clean origin (wrong scheme, includes a path/query, contains a wildcard, etc.) refuses to start the dashboard with a clear error, rather than silently running with a smaller allowlist than you configured.
+- **Ignored while bound to loopback** — loopback is never reachable from another origin's browser regardless of CORS, so a configured `allowed_origins` value while `--host` is unset (or explicitly loopback) is a no-op: the dashboard boots normally, logs a warning that it's being ignored, and CORS stays loopback-only. It only takes effect once you bind non-loopback (`--host <lan-ip>`), which — as with every non-loopback bind — also requires an auth provider to be configured.
+- **Widens the WebSocket Origin guard too** — an extra-allowed origin can also open the `/api/ws` gateway WebSocket, not just make REST calls; the Host-header DNS-rebinding check is unaffected either way.
+
+### Scope: this is not the same as cross-*site* gated access
+
+Gated/OAuth-mode auth uses an `HttpOnly`/`SameSite=Lax` session cookie. `SameSite=Lax` independently blocks that cookie on a genuinely cross-*site* request (a different host or domain) no matter what `allowed_origins` says — so in gated mode, widening CORS realistically only unlocks a same-*site* origin: same host/IP, different port, which is exactly the desktop-browser-fallback shape above. True cross-site gated access (a webapp on an entirely different domain) is a separate, larger problem this setting doesn't solve. The legacy static-token mode isn't cookie-based, so it isn't bound by this ceiling.
+
+### Worked example: connecting apps/desktop's browser-fallback mode
+
+1. Start the dashboard bound to your LAN IP with an auth provider configured:
+   ```bash
+   hermes dashboard --host 192.168.1.50 --port 9119
+   ```
+2. Add the desktop app's static-build origin to the allowlist:
+   ```yaml title="config.yaml"
+   dashboard:
+     allowed_origins:
+       - "http://192.168.1.50:4174"
+   ```
+3. Serve the desktop app's static build (built without Electron) on that port:
+   ```bash
+   npx http-server dist -a 0.0.0.0 -p 4174
+   ```
+4. Open `http://192.168.1.50:4174/?gateway=http://192.168.1.50:9119` from a browser on the same network — the `?gateway=` query param points the renderer's browser-fallback bridge at the dashboard.
 
 ## Development
 
