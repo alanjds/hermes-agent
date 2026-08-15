@@ -6,6 +6,7 @@ import { ErrorIcon } from '@/components/ui/error-state'
 import { LogView } from '@/components/ui/log-view'
 import type { DesktopConnectionConfig } from '@/global'
 import { useI18n } from '@/i18n'
+import { isBrowserFallbackActive } from '@/lib/browser-bridge'
 import { FileText, Loader2, LogIn, RefreshCw, Wrench } from '@/lib/icons'
 import { $desktopBoot } from '@/store/boot'
 import { notify, notifyError } from '@/store/notifications'
@@ -47,8 +48,17 @@ export function BootFailureOverlay() {
       return
     }
 
-    void window.hermesDesktop
-      ?.getRecentLogs()
+    // `?.getRecentLogs` alone only guards the member access — a bridge that's
+    // present but doesn't implement this method (e.g. the browser-fallback
+    // shim) would still call `undefined()` and throw. Read it into a local
+    // first so a missing method is a clean no-op.
+    const getRecentLogs = window.hermesDesktop?.getRecentLogs
+
+    if (!getRecentLogs) {
+      return
+    }
+
+    void getRecentLogs()
       .then(res => setLogs(res.lines ?? []))
       .catch(() => undefined)
   }, [visible])
@@ -110,22 +120,27 @@ export function BootFailureOverlay() {
     return null
   }
 
+  // `?.resetBootstrap()` (etc. below) only guards the member access; a bridge
+  // that's present but doesn't implement the method (e.g. the browser-fallback
+  // shim) would still call `undefined()` and throw. The extra `?.` before
+  // each `()` guards the call itself, and — since it's all one unbroken
+  // optional chain — short-circuits the trailing `.catch(...)` too.
   const retry = async () => {
     setBusy('retry')
-    await window.hermesDesktop?.resetBootstrap().catch(() => undefined)
+    await window.hermesDesktop?.resetBootstrap?.().catch(() => undefined)
     window.location.reload()
   }
 
   const repair = async () => {
     setBusy('repair')
-    await window.hermesDesktop?.repairBootstrap().catch(() => undefined)
+    await window.hermesDesktop?.repairBootstrap?.().catch(() => undefined)
     window.location.reload()
   }
 
   const switchToLocalGateway = async () => {
     setBusy('local')
     // applyConnectionConfig reloads the window from the main process.
-    await window.hermesDesktop?.applyConnectionConfig({ mode: 'local' }).catch(() => undefined)
+    await window.hermesDesktop?.applyConnectionConfig?.({ mode: 'local' }).catch(() => undefined)
     setBusy(null)
   }
 
@@ -163,7 +178,7 @@ export function BootFailureOverlay() {
     }
   }
 
-  const openLogs = () => void window.hermesDesktop?.revealLogs().catch(() => undefined)
+  const openLogs = () => void window.hermesDesktop?.revealLogs?.().catch(() => undefined)
   const copy = t.boot.failure
 
   const label = signInLabel(remoteReauth, {
@@ -205,20 +220,29 @@ export function BootFailureOverlay() {
                   {copy.retry}
                 </Button>
               )}
-              {!remoteReauth ? (
+              {/* Repair install / switch to local gateway / reveal log file are all
+                  Electron-only recovery paths with nothing to act on in
+                  browser-fallback mode (no local install, no local gateway, no
+                  desktop.log on disk) — hide rather than show a button that
+                  silently does nothing. */}
+              {!remoteReauth && !isBrowserFallbackActive() ? (
                 <Button disabled={Boolean(busy)} onClick={() => void repair()} variant="secondary">
                   {busy === 'repair' ? <Loader2 className="animate-spin" /> : <Wrench />}
                   {copy.repairInstall}
                 </Button>
               ) : null}
-              <Button disabled={Boolean(busy)} onClick={() => void switchToLocalGateway()} variant="secondary">
-                {busy === 'local' ? <Loader2 className="animate-spin" /> : null}
-                {copy.useLocalGateway}
-              </Button>
-              <Button onClick={openLogs} variant="ghost">
-                <FileText />
-                {copy.openLogs}
-              </Button>
+              {!isBrowserFallbackActive() ? (
+                <Button disabled={Boolean(busy)} onClick={() => void switchToLocalGateway()} variant="secondary">
+                  {busy === 'local' ? <Loader2 className="animate-spin" /> : null}
+                  {copy.useLocalGateway}
+                </Button>
+              ) : null}
+              {!isBrowserFallbackActive() ? (
+                <Button onClick={openLogs} variant="ghost">
+                  <FileText />
+                  {copy.openLogs}
+                </Button>
+              ) : null}
             </div>
             <p className="text-xs text-muted-foreground">{remoteReauth ? copy.remoteSignInHint : copy.repairHint}</p>
           </div>

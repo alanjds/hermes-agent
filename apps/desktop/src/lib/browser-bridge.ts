@@ -178,8 +178,11 @@ async function resolveConnection(): Promise<HermesConnection> {
   const baseUrl = normalizeBaseUrl(rawUrl)
   const token = resolveStaticToken()
   const authMode = await probeAuthMode(baseUrl, token)
+
   const wsUrl =
-    authMode === 'oauth' ? buildWsUrl(baseUrl, 'ticket', await mintWsTicket(baseUrl)) : buildWsUrl(baseUrl, 'token', token)
+    authMode === 'oauth'
+      ? buildWsUrl(baseUrl, 'ticket', await mintWsTicket(baseUrl))
+      : buildWsUrl(baseUrl, 'token', token)
 
   const connection: HermesConnection = {
     authMode,
@@ -213,7 +216,8 @@ if (typeof window !== 'undefined' && !window.hermesDesktop && resolveGatewayUrl(
   installed = true
 
   const bridge: Partial<Window['hermesDesktop']> = {
-    api: <T,>(request: HermesApiRequest) => fetchJson<T>(cachedConnection?.baseUrl ?? '', cachedConnection?.token ?? '', request),
+    api: <T>(request: HermesApiRequest) =>
+      fetchJson<T>(cachedConnection?.baseUrl ?? '', cachedConnection?.token ?? '', request),
     getBootProgress: () =>
       Promise.resolve<DesktopBootProgress>({
         error: null,
@@ -228,7 +232,9 @@ if (typeof window !== 'undefined' && !window.hermesDesktop && resolveGatewayUrl(
     getGatewayWsUrl: async () => {
       const conn = cachedConnection ?? (await resolveConnection())
 
-      return conn.authMode === 'oauth' ? buildWsUrl(conn.baseUrl, 'ticket', await mintWsTicket(conn.baseUrl)) : conn.wsUrl
+      return conn.authMode === 'oauth'
+        ? buildWsUrl(conn.baseUrl, 'ticket', await mintWsTicket(conn.baseUrl))
+        : conn.wsUrl
     },
     onBackendExit: () => () => {},
     onBootProgress: () => () => {}
