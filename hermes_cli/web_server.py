@@ -313,16 +313,9 @@ def _dashboard_cors_kwargs(extra_origins: Tuple[str, ...] = ()) -> dict:
     }
 
 
-try:
-    _cors_extra_origins = resolve_allowed_origins()
-except InvalidOriginError as _cors_exc:
-    raise SystemExit(
-        f"Invalid dashboard.allowed_origins / HERMES_DASHBOARD_ALLOWED_ORIGINS entry: {_cors_exc}\n\n"
-        "Each entry must be an exact origin (scheme://host[:port]), e.g. "
-        '"http://192.168.1.50:4174" — no wildcards, paths, or query strings.'
-    ) from _cors_exc
-
-app.add_middleware(CORSMiddleware, **_dashboard_cors_kwargs(_cors_extra_origins))
+# NOTE: the actual ``app.add_middleware(CORSMiddleware, ...)`` call is
+# deferred to the bottom of the middleware section below (after
+# ``_token_auth_seam``), not made here — see the comment there for why.
 
 # ---------------------------------------------------------------------------
 # Endpoints that do NOT require the session token.  Everything else under
@@ -552,9 +545,8 @@ async def auth_middleware(request: Request, call_next):
 
 @app.middleware("http")
 async def _token_auth_seam(request: Request, call_next):
-    """Outermost auth seam: non-interactive bearer-token auth for opted-in routes.
+    """Non-interactive bearer-token auth for opted-in routes.
 
-    Registered LAST so it runs FIRST (Starlette middleware is outermost-last).
     A registered token route is fully owned here — authenticate by token,
     attach the principal + ``token_authenticated`` flag, and let the downstream
     cookie/session gates skip enforcement. Non-token routes pass straight
@@ -562,6 +554,38 @@ async def _token_auth_seam(request: Request, call_next):
     """
     from hermes_cli.dashboard_auth.token_auth import token_auth_middleware
     return await token_auth_middleware(request, call_next)
+
+
+# CORSMiddleware is registered LAST — i.e. outermost, wrapping every
+# middleware above (Starlette wraps in the reverse of add_middleware() call
+# order: the last one added ends up running first on the way in / last on
+# the way out). This has to be outermost, not innermost, for two reasons:
+#
+#   1. A browser's CORS preflight (``OPTIONS`` with
+#      ``Access-Control-Request-Method``) carries no auth at all — it's not
+#      supposed to. If any auth-gate middleware sat outside CORSMiddleware,
+#      it would 401 the preflight itself before CORSMiddleware ever got a
+#      chance to answer it, breaking every credentialed cross-origin request
+#      (including same-origin-looking simple GETs that add a custom header
+#      like ``X-Hermes-Session-Token``, which forces a preflight).
+#   2. An auth rejection (401 from auth_middleware / the OAuth gate, 400
+#      from the Host-header check) is itself a response that needs
+#      ``Access-Control-Allow-Origin`` attached so a cross-origin caller's
+#      browser lets JS read it — otherwise a wrong/expired/missing token
+#      surfaces as an opaque "NetworkError" instead of a readable 401 body.
+#
+# Both require every response — success or rejection — to pass back out
+# through CORSMiddleware, which only happens if it's the outermost layer.
+try:
+    _cors_extra_origins = resolve_allowed_origins()
+except InvalidOriginError as _cors_exc:
+    raise SystemExit(
+        f"Invalid dashboard.allowed_origins / HERMES_DASHBOARD_ALLOWED_ORIGINS entry: {_cors_exc}\n\n"
+        "Each entry must be an exact origin (scheme://host[:port]), e.g. "
+        '"http://192.168.1.50:4174" — no wildcards, paths, or query strings.'
+    ) from _cors_exc
+
+app.add_middleware(CORSMiddleware, **_dashboard_cors_kwargs(_cors_extra_origins))
 
 
 # ---------------------------------------------------------------------------

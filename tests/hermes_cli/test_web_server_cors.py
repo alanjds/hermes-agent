@@ -259,6 +259,76 @@ class TestStartServerAllowedOrigins:
             )
 
 
+class TestCorsWrapsAuthRejections:
+    """Regression guard: CORSMiddleware must be the OUTERMOST middleware on
+    the real app, wrapping the auth-gate middlewares — not nested inside
+    them.
+
+    Concretely reproduces the bug hit when testing apps/desktop's
+    browser-fallback mode against a loopback dashboard from a different
+    origin/port: with CORSMiddleware registered before (i.e. innermost of)
+    auth_middleware/the OAuth gate/host_header_middleware, an unauthenticated
+    preflight ``OPTIONS`` request got 401'd by auth_middleware before ever
+    reaching CORSMiddleware — so the browser's actual request (e.g.
+    ``fetch`` with the ``X-Hermes-Session-Token`` header, which forces a
+    preflight) never went out at all, surfacing as a bare "NetworkError".
+    Same root cause made every auth-rejection response (401/400) come back
+    without ``Access-Control-Allow-Origin``, which a browser also treats as
+    an opaque network failure rather than a readable error body.
+    """
+
+    def test_preflight_not_blocked_by_auth_middleware(
+        self, restore_app_state
+    ):
+        web_server.app.state.bound_host = None
+        web_server.app.state.auth_required = False
+        client = TestClient(web_server.app)
+
+        r = client.options(
+            "/api/config",
+            headers={
+                "Origin": "http://127.0.0.1:5174",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Headers": "x-hermes-session-token",
+            },
+        )
+        assert r.status_code == 200, (
+            f"preflight must be answered by CORSMiddleware, not 401'd by "
+            f"an auth gate: got {r.status_code}: {r.text}"
+        )
+        assert r.headers.get("access-control-allow-origin") == "http://127.0.0.1:5174"
+
+    def test_unauthenticated_rejection_still_carries_cors_headers(
+        self, restore_app_state
+    ):
+        web_server.app.state.bound_host = None
+        web_server.app.state.auth_required = False
+        client = TestClient(web_server.app)
+
+        r = client.get("/api/config", headers={"Origin": "http://127.0.0.1:5174"})
+        assert r.status_code == 401
+        assert r.headers.get("access-control-allow-origin") == "http://127.0.0.1:5174", (
+            "an auth-rejection response must still be CORS-readable by the "
+            "caller, or a browser reports it as a NetworkError instead of "
+            "a 401 the SPA can act on"
+        )
+
+    def test_authenticated_request_carries_cors_headers(self, restore_app_state):
+        web_server.app.state.bound_host = None
+        web_server.app.state.auth_required = False
+        client = TestClient(web_server.app)
+
+        r = client.get(
+            "/api/config",
+            headers={
+                "Origin": "http://127.0.0.1:5174",
+                "X-Hermes-Session-Token": web_server._SESSION_TOKEN,
+            },
+        )
+        assert r.status_code == 200
+        assert r.headers.get("access-control-allow-origin") == "http://127.0.0.1:5174"
+
+
 def test_resolve_allowed_origins_reexported_for_module_import_time_check():
     """Sanity check that InvalidOriginError is importable the way
     web_server.py itself imports it (regression guard for the import-time
