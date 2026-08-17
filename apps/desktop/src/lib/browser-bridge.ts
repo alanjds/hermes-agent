@@ -88,6 +88,34 @@ function buildWsUrl(baseUrl: string, param: 'ticket' | 'token', value: string): 
   return `${scheme}://${parsed.host}${prefix}/api/ws?${param}=${encodeURIComponent(value)}`
 }
 
+// A `hermes serve` backend shares its asyncio event loop with the agent
+// itself — a heavy turn (delegation running several subagents, a long tool
+// call) can starve it for several seconds at a time, but it's still alive
+// and will answer once it catches its breath. A bare `fetch()` has no
+// timeout at all, so without this every one of the bridge's calls below
+// would hang exactly as long as the backend is stalled — including the one
+// inside `resolveConnection()` that both the initial boot *and* every
+// reconnect-after-drop attempt awaits. An unbounded hang there doesn't just
+// delay boot, it wedges the reconnect loop for good (its `reconnecting`
+// guard never clears because the awaited promise never settles), so a
+// transient stall permanently reads as "Gateway offline" with no recovery.
+// 20s is generous relative to the backend's own stall tolerance (it treats
+// up to 10s as "still alive" per WSTransport's write timeout) while still
+// guaranteeing every call here eventually settles one way or another, so
+// the existing catch/retry-with-backoff paths actually get a turn to run.
+const BRIDGE_FETCH_TIMEOUT_MS = 20_000
+
+async function fetchWithTimeout(url: string, init: RequestInit = {}): Promise<Response> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), BRIDGE_FETCH_TIMEOUT_MS)
+
+  try {
+    return await fetch(url, { ...init, signal: controller.signal })
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 async function fetchJson<T>(baseUrl: string, token: string, request: HermesApiRequest): Promise<T> {
   if (!baseUrl) {
     throw new Error('Browser-fallback bridge: no gateway connection resolved yet.')
@@ -99,11 +127,17 @@ async function fetchJson<T>(baseUrl: string, token: string, request: HermesApiRe
     headers.set(SESSION_HEADER, token)
   }
 
-  const res = await fetch(`${baseUrl}${request.path}`, {
+  const res = await fetchWithTimeout(`${baseUrl}${request.path}`, {
     body: request.body === undefined ? undefined : JSON.stringify(request.body),
     credentials: 'include',
     headers,
     method: request.method ?? 'GET'
+  }).catch(err => {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new Error(`${request.path}: timed out waiting on gateway (backend busy?)`)
+    }
+
+    throw err
   })
 
   if (!res.ok) {
@@ -120,7 +154,15 @@ async function fetchJson<T>(baseUrl: string, token: string, request: HermesApiRe
 }
 
 async function mintWsTicket(baseUrl: string): Promise<string> {
-  const res = await fetch(`${baseUrl}/api/auth/ws-ticket`, { credentials: 'include', method: 'POST' })
+  const res = await fetchWithTimeout(`${baseUrl}/api/auth/ws-ticket`, { credentials: 'include', method: 'POST' }).catch(
+    err => {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        throw new Error('/api/auth/ws-ticket: timed out waiting on gateway (backend busy?)')
+      }
+
+      throw err
+    }
+  )
 
   if (!res.ok) {
     throw new Error(`/api/auth/ws-ticket: HTTP ${res.status}`)
@@ -140,7 +182,7 @@ async function mintWsTicket(baseUrl: string): Promise<string> {
 // so the real error surfaces from the connect attempt instead of here.
 async function probeAuthMode(baseUrl: string, token: string): Promise<'oauth' | 'token'> {
   try {
-    const res = await fetch(`${baseUrl}/api/status`, {
+    const res = await fetchWithTimeout(`${baseUrl}/api/status`, {
       credentials: 'include',
       headers: token ? { [SESSION_HEADER]: token } : undefined
     })
@@ -157,7 +199,9 @@ async function probeAuthMode(baseUrl: string, token: string): Promise<'oauth' | 
       }
     }
   } catch {
-    // Unreachable / CORS-blocked — let the real connect attempt surface it.
+    // Unreachable / CORS-blocked / timed out (backend momentarily stalled) —
+    // let the real connect attempt surface it rather than wedging boot/
+    // reconnect here indefinitely.
   }
 
   return 'token'
