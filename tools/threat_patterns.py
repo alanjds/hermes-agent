@@ -219,10 +219,7 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
     if not content:
         return []
 
-    if len(content) >= cpu_offload.OFFLOAD_THRESHOLD_CHARS:
-        return cpu_offload.offload(_scan_for_threats_impl, content, scope)
-
-    return _scan_for_threats_impl(content, scope)
+    return cpu_offload.offload(_scan_for_threats_impl, content, scope)
 
 
 def _scan_for_threats_impl(content: str, scope: str = "context") -> List[str]:
