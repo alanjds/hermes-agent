@@ -5,6 +5,7 @@ import logging
 import pytest
 
 from agent.redact import redact_sensitive_text, RedactingFormatter
+from tools import cpu_offload
 
 
 @pytest.fixture(autouse=True)
@@ -528,3 +529,44 @@ class TestXaiToken:
     def test_prefix_visible_in_masked_output(self):
         result = redact_sensitive_text(self.KEY, force=True)
         assert result.startswith("xai-AB")
+
+
+class TestOffload:
+    """redact_sensitive_text() offloads large text to a background process
+    pool (see tools/cpu_offload.py) — must redact the same secrets it would
+    inline, and must still redact them if the pool is unavailable."""
+
+    KEY = "sk-proj-abc123def456ghi789jkl012"
+
+    def setup_method(self):
+        cpu_offload._pool = None
+        cpu_offload._pool_unavailable = False
+
+    def teardown_method(self):
+        cpu_offload.shutdown()
+        cpu_offload._pool_unavailable = False
+
+    def _big(self, secret: str) -> str:
+        # Pad well past OFFLOAD_THRESHOLD_CHARS so this genuinely exercises
+        # the pool path, not the inline fast path.
+        pad = "benign filler text.\n" * 500
+        return pad + f"using key {secret}\n" + pad
+
+    def test_large_text_still_redacted_via_pool(self):
+        text = self._big(self.KEY)
+        assert len(text) >= cpu_offload.OFFLOAD_THRESHOLD_CHARS
+
+        result = redact_sensitive_text(text, force=True)
+
+        assert self.KEY not in result
+
+    def test_large_text_still_redacted_when_pool_is_unavailable(self, monkeypatch):
+        # Fail-closed check: a pool that can't be used must not turn into
+        # "return the secret unredacted" — that's the one outcome worse
+        # than running the regex pass inline.
+        monkeypatch.setattr(cpu_offload, "_get_pool", lambda: None)
+        text = self._big(self.KEY)
+
+        result = redact_sensitive_text(text, force=True)
+
+        assert self.KEY not in result

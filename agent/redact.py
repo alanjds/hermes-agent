@@ -11,6 +11,8 @@ import logging
 import os
 import re
 
+from tools import cpu_offload
+
 logger = logging.getLogger(__name__)
 
 # Sensitive query-string parameter names (case-insensitive exact match).
@@ -360,7 +362,12 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     record (-68%). The pre-checks are conservative — false positives
     still run the full regex, which then doesn't match. False negatives
     are impossible because every regex requires the gated substring to
-    match.
+    match. Those pre-checks barely filter code-shaped text though (nearly
+    every source file has ``=`` and ``:``), so for large tool
+    output/context text — exactly where this cost actually shows up —
+    the substitution passes below are offloaded to a background process
+    pool (``tools/cpu_offload.py``) rather than holding the GIL against
+    ``hermes serve``'s asyncio event loop for the duration.
     """
     if text is None:
         return None
@@ -371,6 +378,21 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     if not (force or _REDACT_ENABLED):
         return text
 
+    if len(text) >= cpu_offload.OFFLOAD_THRESHOLD_CHARS:
+        return cpu_offload.offload(_redact_sensitive_text_impl, text, force=force, code_file=code_file)
+
+    return _redact_sensitive_text_impl(text, force=force, code_file=code_file)
+
+
+def _redact_sensitive_text_impl(text: str, *, force: bool = False, code_file: bool = False) -> str:
+    """Actual redaction body — see :func:`redact_sensitive_text`. Split out
+    so it can run either inline or as the target of a ``cpu_offload``
+    process-pool call (which needs a plain, module-level,
+    picklable-by-reference callable). Callers should use
+    :func:`redact_sensitive_text`, not this directly — it assumes ``text``
+    is already a non-empty string and that the caller already decided
+    redaction should run (the ``force``/``_REDACT_ENABLED`` gate lives in
+    the wrapper)."""
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
         text = _PREFIX_RE.sub(lambda m: _mask_token(m.group(1)), text)
