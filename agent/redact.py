@@ -378,10 +378,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
     if not (force or _REDACT_ENABLED):
         return text
 
-    if len(text) >= cpu_offload.OFFLOAD_THRESHOLD_CHARS:
-        return cpu_offload.offload(_redact_sensitive_text_impl, text, force=force, code_file=code_file)
-
-    return _redact_sensitive_text_impl(text, force=force, code_file=code_file)
+    return cpu_offload.offload(_redact_sensitive_text_impl, text, force=force, code_file=code_file)
 
 
 def _redact_sensitive_text_impl(text: str, *, force: bool = False, code_file: bool = False) -> str:
