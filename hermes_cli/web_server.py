@@ -79,7 +79,7 @@ from gateway.status import (
     parse_active_agents,
     read_runtime_status,
 )
-from utils import env_var_enabled
+from utils import env_float, env_var_enabled
 
 try:
     from fastapi import (
@@ -2590,6 +2590,210 @@ def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
     _ACTION_COMMANDS[name] = tuple(subcommand)
     _ACTION_PROCS[name] = proc
     return proc
+
+
+# ── Dedicated single-tenant backends for browser-fallback clients (PoC) ────
+#
+# apps/desktop's Electron mode already sidesteps the "one session's heavy
+# agent work stalls everyone else's WebSocket" problem by spawning a
+# dedicated `hermes dashboard --port 0` child PER WINDOW (see
+# apps/desktop/electron/main.cjs's own `spawn(...)` call — this mirrors
+# that exact command). A plain browser tab (apps/desktop's browser-fallback
+# mode, or any other browser-only client) can't spawn a process itself, so
+# it's stuck sharing whatever dashboard the operator already has running —
+# the same shared, multi-tenant process whose event loop concurrent agent
+# turns were found to stall for seconds at a time (see tools/cpu_offload.py
+# and WSTransport's "loop stalled" warning in tui_gateway/ws.py). This gives
+# a browser client the same escape hatch: ask the shared ("seed") dashboard
+# to spawn (or hand back an already-running) DEDICATED backend, then talk
+# to that one directly from then on. No protocol change — the dedicated
+# child speaks the exact same tui_gateway WS JSON-RPC dialect; only the
+# process topology changes.
+#
+# Registry is in-memory, this process's lifetime only — deliberately not
+# persisted. If the seed dashboard restarts, it simply forgets about
+# backends it previously spawned; nothing leaks because each dedicated
+# child reaps *itself* once nothing is connected to it (see
+# _self_reap_idle_task), independent of whether the seed that spawned it
+# still remembers it.
+_desktop_spawned_backends: Dict[str, Dict[str, Any]] = {}
+_desktop_spawned_backends_lock = threading.Lock()
+
+# How long a dedicated backend spawned by this endpoint will sit with zero
+# active /api/ws connections before self-exiting (env-set only on the
+# dedicated child, never on a normal `hermes dashboard`. See
+# _self_reap_idle_task.
+_DESKTOP_BACKEND_SELF_REAP_IDLE_S = 120
+
+# How long to wait for a freshly spawned dedicated backend to print its
+# HERMES_DASHBOARD_READY line before giving up and killing it.
+_DESKTOP_BACKEND_READY_TIMEOUT_S = 15.0
+
+
+def _desktop_backend_alive(backend_id: str) -> Optional[Dict[str, Any]]:
+    """Return the registry entry for ``backend_id`` iff its process is still
+    alive, dropping (and returning None for) a dead one."""
+    with _desktop_spawned_backends_lock:
+        info = _desktop_spawned_backends.get(backend_id)
+        if info is None:
+            return None
+        proc: subprocess.Popen = info["process"]
+        if proc.poll() is not None:
+            _desktop_spawned_backends.pop(backend_id, None)
+            return None
+        return info
+
+
+def _spawn_dedicated_desktop_backend() -> Dict[str, Any]:
+    """Spawn a fresh, single-tenant ``hermes dashboard`` child and block
+    until it reports ready (or the ready timeout elapses).
+
+    Blocking (subprocess + readline) — callers must run this via
+    ``asyncio.to_thread`` rather than awaiting it directly on the event
+    loop. Mirrors apps/desktop/electron/main.cjs's own backend spawn
+    (fresh token, ``--port 0`` for an OS-assigned ephemeral port, same
+    ``hermes dashboard`` command) plus one addition:
+    HERMES_DASHBOARD_SELF_REAP_IDLE_S, which only this spawn path sets, so
+    only backends spawned this way ever self-exit when idle.
+    """
+    token = secrets.token_urlsafe(32)
+    cmd = [
+        _dashboard_spawn_executable(), "-m", "hermes_cli.main",
+        "dashboard", "--no-open", "--host", "127.0.0.1", "--port", "0",
+    ]
+    env = {
+        **os.environ,
+        "HERMES_DASHBOARD_SESSION_TOKEN": token,
+        "HERMES_DASHBOARD_SELF_REAP_IDLE_S": str(_DESKTOP_BACKEND_SELF_REAP_IDLE_S),
+        "HERMES_NONINTERACTIVE": "1",
+    }
+    popen_kwargs: Dict[str, Any] = {
+        "cwd": str(PROJECT_ROOT),
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.DEVNULL,
+        "env": env,
+        "text": True,
+        "bufsize": 1,
+    }
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = windows_detach_flags()
+    else:
+        popen_kwargs["start_new_session"] = True
+
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+
+    port: Optional[int] = None
+    deadline = time.monotonic() + _DESKTOP_BACKEND_READY_TIMEOUT_S
+    ready_re = re.compile(r"HERMES_DASHBOARD_READY port=(\d+)")
+    while time.monotonic() < deadline:
+        line = proc.stdout.readline() if proc.stdout else ""
+        if not line:
+            if proc.poll() is not None:
+                break
+            continue
+        m = ready_re.search(line)
+        if m:
+            port = int(m.group(1))
+            break
+
+    if port is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        raise RuntimeError("dedicated backend did not become ready in time")
+
+    backend_id = secrets.token_urlsafe(16)
+    info = {"process": proc, "base_url": f"http://127.0.0.1:{port}", "token": token}
+    with _desktop_spawned_backends_lock:
+        _desktop_spawned_backends[backend_id] = info
+    _log.info("Spawned dedicated desktop backend id=%s pid=%s port=%s", backend_id, proc.pid, port)
+    return {"backend_id": backend_id, "base_url": info["base_url"], "token": token}
+
+
+# Bumped/decremented around every /api/ws connection's lifetime (see
+# gateway_ws). Only consulted when HERMES_DASHBOARD_SELF_REAP_IDLE_S is set
+# — i.e. only on a dedicated backend this module spawned for itself, never
+# on a normal `hermes dashboard`.
+_active_ws_count = 0
+
+
+async def _self_reap_idle_task() -> None:
+    """Self-exit once this process has had zero active /api/ws connections
+    for HERMES_DASHBOARD_SELF_REAP_IDLE_S seconds straight.
+
+    PoC-simple by design: no grace period distinct from "just started" (a
+    dedicated backend nobody ever connects to reaps itself on the same
+    timer as one that connected once and was later abandoned — both are
+    "nothing needs this process," so one rule covers both), and reset
+    happens implicitly any time the count is above zero, matching how
+    apps/desktop's browser-fallback client is expected to behave: as long
+    as its WS is connected, this process is never a self-reap candidate.
+    """
+    idle_s = env_float("HERMES_DASHBOARD_SELF_REAP_IDLE_S", 0)
+    if idle_s <= 0:
+        return
+
+    zero_since = time.monotonic()
+    while True:
+        await asyncio.sleep(5)
+        if _active_ws_count > 0:
+            zero_since = None
+            continue
+        if zero_since is None:
+            zero_since = time.monotonic()
+            continue
+        if time.monotonic() - zero_since >= idle_s:
+            _log.info(
+                "Self-reaping: no active /api/ws connections for %.0fs (HERMES_DASHBOARD_SELF_REAP_IDLE_S=%s)",
+                idle_s, idle_s,
+            )
+            os._exit(0)
+
+
+@app.post("/api/desktop/spawn-backend")
+async def desktop_spawn_backend(request: Request) -> Dict[str, Any]:
+    """Hand a browser client a dedicated, single-tenant backend to talk to.
+
+    PoC for apps/desktop's browser-fallback mode: rather than connecting
+    straight to this (potentially shared, multi-tenant) dashboard's own
+    gateway, a client calls this once to get pointed at an isolated
+    backend instead — see the block comment above
+    _desktop_spawned_backends for the full rationale.
+
+    Body: ``{"backend_id": "..."}`` (optional). If given and that backend
+    is still alive, its existing connection info is returned unchanged
+    (no new process spawned) — the client is expected to pass back a
+    ``backend_id`` it persisted (e.g. in localStorage) from a previous
+    call, so a page reload reuses its own dedicated backend rather than
+    accumulating a fresh one every time. Unknown/dead/omitted ``backend_id``
+    spawns a fresh one.
+
+    Gated by the same auth as every other non-public ``/api/*`` route
+    (host_header_middleware / auth_middleware / the OAuth gate) — this is
+    not a new unauthenticated surface, it's reachable only by a caller who
+    already holds this dashboard's own session credential.
+    """
+    body: Any = {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    backend_id = body.get("backend_id") if isinstance(body, dict) else None
+
+    if backend_id:
+        info = _desktop_backend_alive(backend_id)
+        if info is not None:
+            return {"backend_id": backend_id, "base_url": info["base_url"], "token": info["token"], "reused": True}
+
+    try:
+        result = await asyncio.to_thread(_spawn_dedicated_desktop_backend)
+    except Exception as exc:
+        _log.exception("Failed to spawn dedicated desktop backend")
+        raise HTTPException(status_code=500, detail=f"Failed to spawn dedicated backend: {exc}")
+    result["reused"] = False
+    return result
 
 
 def _tail_lines(path: Path, n: int) -> List[str]:
@@ -12073,7 +12277,16 @@ async def gateway_ws(ws: WebSocket) -> None:
 
     from tui_gateway.ws import handle_ws
 
-    await handle_ws(ws)
+    # Feeds _self_reap_idle_task's countdown (PoC: apps/desktop dedicated
+    # backend spawning, see _spawn_dedicated_desktop_backend) — a no-op
+    # counter bump on every normal dashboard, since that task only exists
+    # when HERMES_DASHBOARD_SELF_REAP_IDLE_S is set.
+    global _active_ws_count
+    _active_ws_count += 1
+    try:
+        await handle_ws(ws)
+    finally:
+        _active_ws_count -= 1
 
 
 # ---------------------------------------------------------------------------
@@ -13530,6 +13743,10 @@ def start_server(
             print(f"HERMES_DASHBOARD_READY port={actual_port}", flush=True)
             print(f"  Hermes Web UI → http://{host}:{actual_port}")
             _maybe_open_browser(host, actual_port, open_browser, initial_profile)
+
+            # No-op unless HERMES_DASHBOARD_SELF_REAP_IDLE_S is set (only true
+            # for a dedicated backend spawned by /api/desktop/spawn-backend).
+            asyncio.create_task(_self_reap_idle_task())
 
             await server.main_loop()
             if server.started:

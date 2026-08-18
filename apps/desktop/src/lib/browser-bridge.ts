@@ -207,6 +207,132 @@ async function probeAuthMode(baseUrl: string, token: string): Promise<'oauth' | 
   return 'token'
 }
 
+interface DedicatedBackend {
+  backendId: string
+  baseUrl: string
+  token: string
+}
+
+const DEDICATED_BACKEND_STORAGE_PREFIX = 'hermes-dedicated-backend:'
+
+function dedicatedBackendStorageKey(seedBaseUrl: string): string {
+  return `${DEDICATED_BACKEND_STORAGE_PREFIX}${seedBaseUrl}`
+}
+
+function loadStoredDedicatedBackend(seedBaseUrl: string): DedicatedBackend | null {
+  try {
+    const raw = window.localStorage.getItem(dedicatedBackendStorageKey(seedBaseUrl))
+
+    if (!raw) {
+      return null
+    }
+
+    const parsed = JSON.parse(raw) as Partial<DedicatedBackend>
+
+    if (typeof parsed.backendId === 'string' && typeof parsed.baseUrl === 'string' && typeof parsed.token === 'string') {
+      return parsed as DedicatedBackend
+    }
+  } catch {
+    // Corrupt JSON / storage unavailable (private browsing can throw on
+    // read too, not just write) — treat identically to "nothing stored".
+  }
+
+  return null
+}
+
+function storeDedicatedBackend(seedBaseUrl: string, backend: DedicatedBackend): void {
+  try {
+    window.localStorage.setItem(dedicatedBackendStorageKey(seedBaseUrl), JSON.stringify(backend))
+  } catch {
+    // Storage full/unavailable — not fatal, just means every reload
+    // re-spawns instead of reusing. The dedicated backend itself still
+    // works fine for the rest of this page's lifetime either way.
+  }
+}
+
+async function probeDedicatedBackendAlive(backend: DedicatedBackend): Promise<boolean> {
+  try {
+    const res = await fetchWithTimeout(`${backend.baseUrl}/api/status`, {
+      headers: { [SESSION_HEADER]: backend.token }
+    })
+
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+async function spawnOrReuseDedicatedBackend(
+  seedBaseUrl: string,
+  seedToken: string,
+  staleId?: string
+): Promise<DedicatedBackend> {
+  const res = await fetchWithTimeout(`${seedBaseUrl}/api/desktop/spawn-backend`, {
+    body: JSON.stringify(staleId ? { backend_id: staleId } : {}),
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(seedToken ? { [SESSION_HEADER]: seedToken } : {})
+    },
+    method: 'POST'
+  })
+
+  if (!res.ok) {
+    throw new Error(`/api/desktop/spawn-backend: HTTP ${res.status}`)
+  }
+
+  const body = (await res.json()) as { backend_id: string; base_url: string; token: string }
+
+  return { backendId: body.backend_id, baseUrl: body.base_url, token: body.token }
+}
+
+// Resolves the backend apps/desktop should actually talk to: a dedicated,
+// single-tenant `hermes dashboard` child spawned (or reused) by the "seed"
+// gateway from ?gateway=, rather than the seed itself.
+//
+// PoC rationale: the seed may be a shared, multi-tenant dashboard the
+// operator also uses for other sessions/cron/messaging platforms — its
+// asyncio event loop can stall for seconds at a time under concurrent
+// agent work happening elsewhere entirely (see tools/cpu_offload.py and
+// WSTransport's "loop stalled" warning in tui_gateway/ws.py), which is
+// exactly the failure mode that made this bridge need generous fetch
+// timeouts and patient reconnect logic in the first place. apps/desktop's
+// Electron mode never hits this because it spawns a dedicated backend per
+// window (see electron/main.cjs); this gives a browser tab the same
+// escape hatch via hermes_cli/web_server.py's /api/desktop/spawn-backend
+// — see that endpoint's docstring for the server-side half of this. No
+// wire-protocol change: the dedicated child speaks the exact same
+// tui_gateway WS JSON-RPC dialect, just isolated onto its own process.
+//
+// Always falls back to `null` (meaning: connect straight to the seed,
+// exactly like before this existed) on any failure — an older seed
+// without this endpoint, or one too stalled to even answer a cheap spawn
+// request, must never block boot.
+//
+// PoC opt-out: ?dedicated=0 skips this outright, for comparing behavior
+// against the seed directly while this is being validated.
+async function resolveDedicatedBackend(seedBaseUrl: string, seedToken: string): Promise<DedicatedBackend | null> {
+  if (readParam('dedicated') === '0') {
+    return null
+  }
+
+  const stored = loadStoredDedicatedBackend(seedBaseUrl)
+
+  if (stored && (await probeDedicatedBackendAlive(stored))) {
+    return stored
+  }
+
+  try {
+    const backend = await spawnOrReuseDedicatedBackend(seedBaseUrl, seedToken, stored?.backendId)
+
+    storeDedicatedBackend(seedBaseUrl, backend)
+
+    return backend
+  } catch {
+    return null
+  }
+}
+
 let cachedConnection: HermesConnection | null = null
 
 async function resolveConnection(): Promise<HermesConnection> {
@@ -219,9 +345,17 @@ async function resolveConnection(): Promise<HermesConnection> {
     )
   }
 
-  const baseUrl = normalizeBaseUrl(rawUrl)
-  const token = resolveStaticToken()
-  const authMode = await probeAuthMode(baseUrl, token)
+  const seedBaseUrl = normalizeBaseUrl(rawUrl)
+  const seedToken = resolveStaticToken()
+
+  // A dedicated backend is always loopback-bound + static-token (it's
+  // spawned locally, purely for this one browser session — see
+  // spawn-backend server-side), so its auth mode is already known and the
+  // probeAuthMode() round-trip below is skipped entirely for that path.
+  const dedicated = await resolveDedicatedBackend(seedBaseUrl, seedToken)
+  const baseUrl = dedicated?.baseUrl ?? seedBaseUrl
+  const token = dedicated?.token ?? seedToken
+  const authMode = dedicated ? 'token' : await probeAuthMode(baseUrl, token)
 
   const wsUrl =
     authMode === 'oauth'
