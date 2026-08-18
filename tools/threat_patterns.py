@@ -44,6 +44,8 @@ from __future__ import annotations
 import re
 from typing import List, Optional, Tuple
 
+from tools import cpu_offload
+
 # Each entry: (regex, pattern_id, scope)
 # scope ∈ {"all", "context", "strict"}
 _PATTERNS: List[Tuple[str, str, str]] = [
@@ -206,10 +208,28 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
     Also checks for invisible unicode characters (returned as
     ``"invisible_unicode_U+XXXX"`` so the caller can surface the offending
     codepoint in a log line).
+
+    Large content (context files, sizeable tool output) is offloaded to a
+    background process pool — see ``tools/cpu_offload.py`` — so scanning it
+    doesn't hold the GIL against ``hermes serve``'s asyncio event loop for
+    the duration of a multi-pattern regex sweep. Small content (the common
+    case — a short message) runs inline as before; offloading has its own
+    overhead that only pays off once there's real work to hand off.
     """
     if not content:
         return []
 
+    if len(content) >= cpu_offload.OFFLOAD_THRESHOLD_CHARS:
+        return cpu_offload.offload(_scan_for_threats_impl, content, scope)
+
+    return _scan_for_threats_impl(content, scope)
+
+
+def _scan_for_threats_impl(content: str, scope: str = "context") -> List[str]:
+    """Actual scan body — see :func:`scan_for_threats`. Split out so it can
+    run either inline or as the target of a ``cpu_offload`` process-pool
+    call (which needs a plain, module-level, picklable-by-reference
+    callable)."""
     findings: List[str] = []
 
     # Invisible unicode — single pass through the content set, not 17
