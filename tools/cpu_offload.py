@@ -39,9 +39,12 @@ project already supports (>=3.11).
 from __future__ import annotations
 
 import atexit
+import concurrent.futures
 import logging
+import multiprocessing
 import os
 import threading
+import time
 from concurrent.futures import Executor, ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from typing import Callable, TypeVar
@@ -74,6 +77,31 @@ _pool: Executor | None = None
 _pool_lock = threading.Lock()
 _pool_unavailable = False
 
+# Explicit "spawn", never the platform default. On Linux that default is
+# "fork" — cheap (workers inherit already-imported modules via copy-on-
+# write), but forking a process that already has other threads running is
+# a well-known deadlock hazard: any lock another thread happened to hold at
+# fork time is copied into the child still locked, and nothing in the
+# child will ever release it (the thread that owned it doesn't exist
+# there). hermes serve/hermes dashboard are always multithreaded well
+# before this pool's first lazy use (see tui_gateway/server.py's
+# threading.Thread-per-turn model), so that hazard is not theoretical here.
+# CPython 3.14 reaches the same conclusion generally — it moved off a bare
+# "fork" default for exactly this reason. "spawn" starts each worker as a
+# genuinely fresh interpreter, sidestepping the hazard entirely, at the
+# cost of a slower first-use latency — paid once per process lifetime
+# since the pool is a lazy singleton, not per call.
+#
+# Note this alone was NOT enough to fix the CI hang that motivated the
+# hardening below (_hard_shutdown/_SHUTDOWN_GRACE_S) — that hang
+# reproduced identically under both "fork" and "spawn". Its actual cause
+# was downstream of worker startup, in this pool's shutdown path — see the
+# comment above _SHUTDOWN_GRACE_S for the full story. Keeping "spawn"
+# regardless, because the fork+threads hazard it avoids is real and
+# independently documented, even though it wasn't the hazard behind that
+# specific hang.
+_MP_CONTEXT = multiprocessing.get_context("spawn")
+
 
 def _get_pool() -> Executor | None:
     """Return the shared process pool, creating it lazily on first use.
@@ -93,7 +121,7 @@ def _get_pool() -> Executor | None:
         if _pool is not None or _pool_unavailable:
             return _pool
         try:
-            _pool = ProcessPoolExecutor(max_workers=_POOL_WORKERS)
+            _pool = ProcessPoolExecutor(max_workers=_POOL_WORKERS, mp_context=_MP_CONTEXT)
         except Exception:
             # Sandboxes / restricted containers sometimes can't fork at all
             # (no /dev/shm, disabled clone()). Falling inline forever is the
@@ -103,6 +131,21 @@ def _get_pool() -> Executor | None:
             _pool_unavailable = True
             return None
         return _pool
+
+
+def _discard_pool(known_bad: Executor) -> None:
+    """Drop ``_pool`` so the next call lazily rebuilds a fresh one.
+
+    Only clears it if it's still the exact instance that just failed — if
+    another thread already swapped in a newer pool (e.g. it lost the same
+    race and rebuilt first), this must not clobber that newer, presumably
+    healthy one.
+    """
+    global _pool
+    with _pool_lock:
+        if _pool is known_bad:
+            _pool = None
+    _hard_shutdown(known_bad)
 
 
 def offload(fn: Callable[..., T], content: str, /, *args, threshold: int = OFFLOAD_THRESHOLD_CHARS, **kwargs) -> T:
@@ -130,30 +173,101 @@ def offload(fn: Callable[..., T], content: str, /, *args, threshold: int = OFFLO
     try:
         future = pool.submit(fn, content, *args, **kwargs)
         return future.result(timeout=_OFFLOAD_TIMEOUT_S)
-    except BrokenProcessPool:
-        # The pool itself is dead (a worker crashed/was killed) — every
-        # future submit would fail the same way. Drop it so the next call
-        # lazily rebuilds a fresh one instead of wedging on a corpse pool
-        # forever, and fall back inline for this call.
-        _log.warning("cpu_offload: process pool broken, rebuilding on next call", exc_info=True)
-        global _pool
-        with _pool_lock:
-            _pool = None
+    except (BrokenProcessPool, concurrent.futures.TimeoutError):
+        # Either the pool is confirmed dead (a worker crashed/was killed —
+        # BrokenProcessPool), or a call outright timed out. Treat both as
+        # pool-poisoning rather than "this one call was just slow": a
+        # timed-out call observed in practice was never actually delivered
+        # to a worker at all (the workers sat idle in queue.get() the whole
+        # time — something in the pool's internal call-queue feeder had
+        # already wedged), so every subsequent call would just pay the same
+        # full timeout again for nothing. Drop the pool so the next call
+        # lazily rebuilds a fresh one, and fall back inline for this call.
+        _log.warning("cpu_offload: process pool broken/timed out, rebuilding on next call", exc_info=True)
+        _discard_pool(pool)
         return fn(content, *args, **kwargs)
     except Exception:
-        # Anything else (submit-time pickling error, a timeout, ...) is
-        # scoped to this one call — the pool itself is still healthy.
+        # Anything else (e.g. a submit-time pickling error) is scoped to
+        # this one call — the pool itself is presumably still healthy.
         _log.warning("cpu_offload: pool call failed, falling back to inline", exc_info=True)
         return fn(content, *args, **kwargs)
 
 
+
+# Bound on how long a torn-down pool's worker processes get to exit on
+# their own before we force-kill them. This exists because of a real,
+# reproduced failure mode, not a hypothetical one: Python's own
+# multiprocessing.util atexit hook (registered by the multiprocessing
+# module itself the first time any Process is created — independent of
+# anything in this module) joins every still-alive non-daemon child with
+# NO timeout of its own at interpreter exit. If shutdown() returns while a
+# worker is still alive, that hook can then hang the entire interpreter
+# forever waiting for it. This reproduced as a genuine CI hang: a large
+# real-world payload through code_execution_tool's redact_sensitive_text
+# call left worker processes that never received their shutdown sentinel
+# — confirmed via py-spy, they sat parked in queue.get() indefinitely, so
+# a plain shutdown(wait=True) with no bound would have just moved the same
+# hang from the built-in atexit hook into this one. Bounding our own wait
+# and force-killing anything left over guarantees this function — and
+# therefore the process's exit — can never hang, no matter what has gone
+# wrong internally in the pool's own machinery.
+_SHUTDOWN_GRACE_S = float(os.environ.get("HERMES_CPU_OFFLOAD_SHUTDOWN_GRACE_S", "5") or "5")
+
+
+def _hard_shutdown(pool: Executor) -> None:
+    # Snapshot the worker Process objects BEFORE calling shutdown(): despite
+    # taking a `wait` argument, ProcessPoolExecutor.shutdown() unconditionally
+    # sets `self._processes = None` right before it returns, every time,
+    # regardless of `wait` — confirmed by reading CPython's
+    # concurrent.futures.process source directly. Reading `_processes` after
+    # shutdown() (an earlier version of this function did exactly that) gets
+    # None, not the pool's workers, and `None.values()` raises AttributeError
+    # — silently swallowed by atexit's per-handler exception handling, so
+    # this function appeared to run but actually crashed before ever
+    # reaching the force-kill loop below, leaving the real hang to happen
+    # exactly as if this function didn't exist at all. Grab the reference
+    # first and this whole class of bug can't recur.
+    #
+    # ProcessPoolExecutor-specific: not every Executor (e.g. a test double,
+    # or a future ThreadPoolExecutor/InterpreterPoolExecutor swap) has
+    # `_processes`, so this is best-effort and silently no-ops otherwise —
+    # those alternatives don't carry the non-daemon-child-at-atexit hazard
+    # this exists to guard against in the first place.
+    processes = list((getattr(pool, "_processes", None) or {}).values())
+
+    pool.shutdown(wait=False, cancel_futures=True)
+
+    deadline = time.monotonic() + _SHUTDOWN_GRACE_S
+
+    for proc in processes:
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            proc.join(timeout=remaining)
+        if proc.is_alive():
+            _log.warning(
+                "cpu_offload: worker pid=%s did not exit within %.1fs, killing it",
+                proc.pid, _SHUTDOWN_GRACE_S,
+            )
+            try:
+                proc.kill()
+                proc.join(timeout=2)
+            except Exception:
+                _log.warning("cpu_offload: failed to force-kill worker pid=%s", proc.pid, exc_info=True)
+
+
 def shutdown() -> None:
-    """Best-effort pool teardown. Safe to call even if never started."""
+    """Best-effort pool teardown. Safe to call even if never started.
+
+    Never blocks longer than ``_SHUTDOWN_GRACE_S`` — see :func:`_hard_shutdown`
+    for why that bound exists.
+    """
     global _pool
     with _pool_lock:
-        if _pool is not None:
-            _pool.shutdown(wait=False, cancel_futures=True)
-            _pool = None
+        pool = _pool
+        _pool = None
+
+    if pool is not None:
+        _hard_shutdown(pool)
 
 
 atexit.register(shutdown)
