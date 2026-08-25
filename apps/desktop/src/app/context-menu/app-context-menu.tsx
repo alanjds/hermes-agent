@@ -4,7 +4,9 @@ import { useEffect } from 'react'
 import { useNavigate } from 'react-router'
 
 import { terminalMenuHandleFor } from '@/app/right-sidebar/terminal/terminal-context-menu'
+import { toggleTargetZoneTabStrip } from '@/components/pane-shell/tree/store'
 import { Codicon } from '@/components/ui/codicon'
+import { HERMES_CONTEXT_MENU_TRIGGER_ATTR } from '@/components/ui/context-menu'
 import { writeClipboardText } from '@/components/ui/copy-button'
 import {
   DropdownMenu,
@@ -565,6 +567,15 @@ function shellSections({ navigate, t }: ShellVerbs): ReactNode[][] {
         label={t.keybinds.actions['view.toggleStatusbar']}
         onSelect={toggleStatusbarVisible}
       />,
+      // The pointer-only way back to a hidden tab strip: right-clicking the
+      // shell reaches this menu from anywhere, including a zone that has no
+      // chrome left to right-click.
+      <Item
+        icon="layout-menubar"
+        key="shell-tabstrip"
+        label={t.keybinds.actions['view.toggleTabStrip']}
+        onSelect={() => void toggleTargetZoneTabStrip()}
+      />,
       <Item
         icon="settings-gear"
         key="shell-settings"
@@ -609,7 +620,11 @@ export function AppContextMenu() {
       const element = event.target instanceof Element ? event.target : null
 
       // Surfaces with their own Radix context menu keep the whole gesture.
-      if (element?.closest('[data-slot="context-menu-trigger"]')) {
+      // Guard the dedicated marker first: Radix `asChild` Slot merges
+      // `mergeProps(slotProps, childProps)` so the child's `data-slot` wins
+      // (status bar footer is `data-slot="statusbar"`). The marker is stamped
+      // after `{...props}` on ContextMenuTrigger and is not overwritten.
+      if (element?.closest(`[${HERMES_CONTEXT_MENU_TRIGGER_ATTR}], [data-slot="context-menu-trigger"]`)) {
         return
       }
 
